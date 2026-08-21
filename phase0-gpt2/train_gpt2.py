@@ -12,6 +12,18 @@ class GPTConfig:
     n_head: int = 12  
     n_embd: int = 768
 
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.gelu = nn.GELU(approximate='tanh')
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -45,8 +57,14 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
 
     def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 
@@ -62,6 +80,46 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    @classmethod
+    def from_pretrained(cls, model_type):
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        config_args = {
+            'gpt2':            dict(n_layer=12, n_head=12, n_embd=768), # 124M params
+            'gpt2-medium':     dict(n_layaer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':      dict(n_layaer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':         dict(n_layaer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        config_args['vocab_size'] = 50257
+        config_args['block_size'] = 1024
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
+
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        #print(sorted(set(sd_keys) - set(sd_keys_hf)))   # есть у меня, нет в HF
+        #print(sorted(set(sd_keys_hf) - set(sd_keys)))   # есть в HF, нет у меня
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+        return model
+    
     def forward(self, idx):
         B, T = idx.shape
         x = self.transformer.wte(idx) + self.transformer.wpe(torch.arange(T))
@@ -73,16 +131,6 @@ class GPT(nn.Module):
 
 
 if __name__ == "__main__":
-    cfg = GPTConfig()
-    attn = CausalSelfAttention(cfg)
-    x = torch.rand(2, 10, cfg.n_embd)
-    y = attn(x)
-    print(y.shape)
-
-    x2 = x.clone()
-    x2[:, -1, :] = torch.rand(2, cfg.n_embd)
-    y2 = attn(x2)
-    print("casul ok:", torch.allclose(y[:, :-1], y2[:, :-1], atol=1e-6))
     # model = GPT(GPTConfig())
     # n_params = sum(p.numel() for p in model.parameters())
     # print(f"{n_params/1e6:.1f}M parameters")
@@ -90,3 +138,16 @@ if __name__ == "__main__":
     # idx = torch.randint(0, 50257, (2, 32))
     # logits = model(idx)
     # print(logits.shape)
+
+    # cfg = GPTConfig()
+    # attn = CausalSelfAttention(cfg)
+    # x = torch.rand(2, 10, cfg.n_embd)
+    # y = attn(x)
+    # print(y.shape)
+
+    # x2 = x.clone()
+    # x2[:, -1, :] = torch.rand(2, cfg.n_embd)
+    # y2 = attn(x2)
+    # print("casul ok:", torch.allclose(y[:, :-1], y2[:, :-1], atol=1e-6))
+    model = GPT.from_pretrained('gpt2')
+    print("weights loaded ok")
