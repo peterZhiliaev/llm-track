@@ -121,15 +121,18 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
         x = self.transformer.wte(idx) + self.transformer.wpe(pos)
         for block in self.transformer.h: 
             x = block(x)
         x = self.transformer['ln_f'](x)
-        x = self.lm_head(x)
-        return x 
+        logits = self.lm_head(x)
+        loss = None
+        if targets is not None: 
+          loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss 
 
 
 if __name__ == "__main__":
@@ -155,33 +158,58 @@ if __name__ == "__main__":
     # model = GPT.from_pretrained('gpt2')
     # print("weights loaded ok")
 
-    model = GPT.from_pretrained('gpt2')
+    # model = GPT.from_pretrained('gpt2')
+    # model.eval()
+    # model.to(device)
+
+    # num_return_sequence = 5 
+    # max_length = 30
+
+
+    # import tiktoken
+    # enc = tiktoken.get_encoding('gpt2')
+    # tokens = enc.encode("Hello, I'm a language model,")
+    # tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).repeat(num_return_sequence, 1)
+    # x = tokens.to(device)
+
+    # torch.manual_seed(42)
+    # torch.cuda.manual_seed(42)
+
+    # while x.size(1) < max_length:
+    #   with torch.no_grad():
+    #     logits = model(x)
+    #     logits = logits[:, -1, :]
+    #     probs = F.softmax(logits, dim=-1)
+    #     topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+    #     ix = torch.multinomial(topk_probs, 1)
+    #     xcol = torch.gather(topk_indices, -1, ix) 
+    #     x = torch.cat((x, xcol), dim=1)
+
+    # for i in range(num_return_sequence):
+    #   print(enc.decode(x[i].tolist()))
+
+    model = GPT(GPTConfig())
     model.eval()
     model.to(device)
 
-    num_return_sequence = 5 
-    max_length = 30
-
-
     import tiktoken
     enc = tiktoken.get_encoding('gpt2')
-    tokens = enc.encode("Hello, I'm a language model,")
-    tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).repeat(num_return_sequence, 1)
-    x = tokens.to(device)
+    with open('input.txt') as f:
+      text = f.read()
+    tokens = enc.encode(text)
+    B, T = 4, 32 
+    buf = torch.tensor(tokens[:B*T + 1])
+    buf = buf.to(device)
+    x = buf[:-1].view(B, T)
+    y = buf[1:].view(B, T)
+    # tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).repeat(num_return_sequence, 1)
+    # x = tokens.to(device)
 
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
-    while x.size(1) < max_length:
-      with torch.no_grad():
-        logits = model(x)
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, 1)
-        xcol = torch.gather(topk_indices, -1, ix) 
-        x = torch.cat((x, xcol), dim=1)
-
-    for i in range(num_return_sequence):
-      print(enc.decode(x[i].tolist()))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    for i in range(50):
+      optimizer.zero_grad()
+      logits, loss = model(x, y)
+      loss.backward()
+      optimizer.step()
+      print(f"step {i}, loss: {loss.item()}")
 
