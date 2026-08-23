@@ -31,3 +31,4 @@ tf32:         944.67 ms |  8672 tok/s | 1.40x
 tf32+bf16:    ~745    ms | ~11000 tok/s | 1.77x
 +compile:     352.05 ms | 23270 tok/s | 3.75x
 +flash:       252.71 ms | 32416 tok/s | 5.22x
++nice50304:   ~240 ms | ~34100 tok/s | 5.50x
