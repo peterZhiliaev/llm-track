@@ -68,10 +68,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # [B, nh, T, hs]
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) 
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        attn = F.softmax(attn, dim=-1) 
-        y = attn @ v 
+        # attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) 
+        # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # attn = F.softmax(attn, dim=-1) 
+        # y = attn @ v 
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y 
@@ -227,6 +228,7 @@ if __name__ == "__main__":
     print(f"{n_params/1e6:.1f}M parameters")
     model.eval()
     model.to(device)
+    model = torch.compile(model)
 
     import tiktoken
     enc = tiktoken.get_encoding('gpt2')
