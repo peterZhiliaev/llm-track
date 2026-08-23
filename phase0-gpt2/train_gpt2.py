@@ -1,7 +1,8 @@
+import math
+import time 
 from dataclasses import dataclass 
 import torch 
 import torch.nn as nn
-import math
 import torch.nn.functional as F
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -16,7 +17,7 @@ class DataLoaderLite:
 
     def next_batch(self):
         B, T = self.B, self.T 
-        buf = self.tokens[self.current_position : self.current_postion + B*T + 1]
+        buf = self.tokens[self.current_position : self.current_position + B*T + 1]
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
         self.current_position += B*T 
@@ -38,6 +39,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -51,6 +53,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, config.n_embd * 3 )   # один Linear: n_embd -> 3 * n_embd (q, k, v разом)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)   # выходная проекция: n_embd -> n_embd
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         # буфер с причинной маской (нижнетреугольная матрица)
@@ -99,6 +102,7 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -219,6 +223,8 @@ if __name__ == "__main__":
     #   print(enc.decode(x[i].tolist()))
 
     model = GPT(GPTConfig())
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"{n_params/1e6:.1f}M parameters")
     model.eval()
     model.to(device)
 
@@ -227,19 +233,28 @@ if __name__ == "__main__":
     with open('input.txt') as f:
       text = f.read()
     tokens = enc.encode(text)
-    B, T = 4, 32 
-    buf = torch.tensor(tokens[:B*T + 1])
-    buf = buf.to(device)
-    x = buf[:-1].view(B, T)
-    y = buf[1:].view(B, T)
+    B, T = 8, 1024
+    train_loader = DataLoaderLite(B, T)
+    # buf = torch.tensor(tokens[:B*T + 1])
+    # buf = buf.to(device)
+    # x = buf[:-1].view(B, T)
+    # y = buf[1:].view(B, T)
     # tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).repeat(num_return_sequence, 1)
     # x = tokens.to(device)
-
+    torch.set_float32_matmul_precision('high')
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    for i in range(50):
+    for step in range(50):
+      t0 = time.time()
       optimizer.zero_grad()
-      logits, loss = model(x, y)
+      x, y = train_loader.next_batch()
+      x = x.to(device)
+      y = y.to(device)
+      with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
       loss.backward()
       optimizer.step()
-      print(f"step {i}, loss: {loss.item()}")
-
+      torch.cuda.synchronize()
+      t1  = time.time()
+      dt = (t1 - t0) * 1000
+      tok_s = (train_loader.B * train_loader.T) / (t1 - t0)
+      print(f"step {step:2d} | loss {loss:.4f} | {dt:7.2f} ms | {tok_s:8.0f} tok/sec")
