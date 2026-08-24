@@ -1,9 +1,10 @@
 import math
-import time 
-from dataclasses import dataclass 
-import torch 
+import time
+from dataclasses import dataclass
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import tiktoken
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 class DataLoaderLite:
@@ -16,11 +17,11 @@ class DataLoaderLite:
         self.current_position = 0
 
     def next_batch(self):
-        B, T = self.B, self.T 
+        B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position + B*T + 1]
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
-        self.current_position += B*T 
+        self.current_position += B*T
         if self.current_position + B*T + 1 > len(self.tokens):
             self.current_position = 0
         return x, y
@@ -29,8 +30,8 @@ class DataLoaderLite:
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304
-    n_layer: int = 12 
-    n_head: int = 12  
+    n_layer: int = 12
+    n_head: int = 12
     n_embd: int = 768
 
 class MLP(nn.Module):
@@ -68,14 +69,14 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # [B, nh, T, hs]
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        # attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) 
+        # attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        # attn = F.softmax(attn, dim=-1) 
-        # y = attn @ v 
+        # attn = F.softmax(attn, dim=-1)
+        # y = attn @ v
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        return y 
+        return y
 
 
 class Block(nn.Module):
@@ -104,6 +105,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
+        self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -112,7 +114,7 @@ class GPT(nn.Module):
                 std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                torch.nn.init.zeros(module.bias)
+                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
@@ -123,9 +125,9 @@ class GPT(nn.Module):
 
         config_args = {
             'gpt2':            dict(n_layer=12, n_head=12, n_embd=768), # 124M params
-            'gpt2-medium':     dict(n_layaer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':      dict(n_layaer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':         dict(n_layaer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2-medium':     dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':      dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':         dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
         }[model_type]
         config_args['vocab_size'] = 50257
         config_args['block_size'] = 1024
@@ -155,19 +157,52 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         return model
-    
+
+    def configure_optimizers(self, weigth_decay, learning_rate, device):
+      param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+      decay_params = [p for p in param_dict.values() if p.dim() >= 2]
+      nodecay_params = [p for p in param_dict.values() if p.dim() < 2]
+      optim_groups = [
+          {'params': decay_params, 'weigth_decay': weigth_decay},
+          {'params': nodecay_params, 'weigth_decay': 0.0},
+      ]
+      num_decay = sum(p.numel() for p in decay_params)
+      num_nodecay = sum(p.numel() for p in nodecay_params)
+      print(f"decayed: {len(decay_params)} tensors, {num_decay:,} params")
+      print(f"non-decayed: {len(nodecay_params)} tensors, {num_nodecay:,} params")
+      import inspect
+      fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+      use_fused = fused_available and 'cuda' in device
+      optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate,
+                                    betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+      return optimizer
+
     def forward(self, idx, targets=None):
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
         x = self.transformer.wte(idx) + self.transformer.wpe(pos)
-        for block in self.transformer.h: 
+        for block in self.transformer.h:
             x = block(x)
         x = self.transformer['ln_f'](x)
         logits = self.lm_head(x)
         loss = None
-        if targets is not None: 
+        if targets is not None:
           loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss 
+        return logits, loss
+
+max_lr = 6e-4 
+min_lr = max_lr * 0.1 
+warmup_steps = 10 
+max_steps = 50 
+
+def get_lr(it):
+  if it < warmup_steps:
+    return max_lr * (it + 1) / warmup_steps
+  if it > max_steps:
+    return min_lr
+  decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+  return min_lr + coeff * (max_lr - min_lr)
 
 
 if __name__ == "__main__":
@@ -197,7 +232,7 @@ if __name__ == "__main__":
     # model.eval()
     # model.to(device)
 
-    # num_return_sequence = 5 
+    # num_return_sequence = 5
     # max_length = 30
 
 
@@ -217,7 +252,7 @@ if __name__ == "__main__":
     #     probs = F.softmax(logits, dim=-1)
     #     topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
     #     ix = torch.multinomial(topk_probs, 1)
-    #     xcol = torch.gather(topk_indices, -1, ix) 
+    #     xcol = torch.gather(topk_indices, -1, ix)
     #     x = torch.cat((x, xcol), dim=1)
 
     # for i in range(num_return_sequence):
@@ -226,15 +261,15 @@ if __name__ == "__main__":
     model = GPT(GPTConfig())
     n_params = sum(p.numel() for p in model.parameters())
     print(f"{n_params/1e6:.1f}M parameters")
-    model.eval()
+    model.train()
     model.to(device)
     model = torch.compile(model)
 
-    import tiktoken
-    enc = tiktoken.get_encoding('gpt2')
-    with open('input.txt') as f:
-      text = f.read()
-    tokens = enc.encode(text)
+    # import tiktoken
+    # enc = tiktoken.get_encoding('gpt2')
+    # with open('input.txt') as f:
+    #   text = f.read()
+    # tokens = enc.encode(text)
     B, T = 8, 1024
     train_loader = DataLoaderLite(B, T)
     # buf = torch.tensor(tokens[:B*T + 1])
@@ -243,8 +278,8 @@ if __name__ == "__main__":
     # y = buf[1:].view(B, T)
     # tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).repeat(num_return_sequence, 1)
     # x = tokens.to(device)
+    optimizer = model.configure_optimizers(weigth_decay=0.1, learning_rate=6e-4, device=device)
     torch.set_float32_matmul_precision('high')
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     for step in range(50):
       t0 = time.time()
       optimizer.zero_grad()
@@ -254,9 +289,13 @@ if __name__ == "__main__":
       with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
       loss.backward()
+      norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+      lr = get_lr(step)
+      for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
       optimizer.step()
       torch.cuda.synchronize()
       t1  = time.time()
       dt = (t1 - t0) * 1000
       tok_s = (train_loader.B * train_loader.T) / (t1 - t0)
-      print(f"step {step:2d} | loss {loss:.4f} | {dt:7.2f} ms | {tok_s:8.0f} tok/sec")
+      print(f"step {step:2d} | loss {loss.item():.4f} | norm {norm:.4f} | lr {lr:.4e} | {dt:7.2f} ms | {tok_s:8.0f} tok/sec")
